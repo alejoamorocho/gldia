@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+.venv
+env/
+venv/
+Lib/
+Scripts/
+share/
+
+# Project Data
+# Large files to be stored in Drive
+data/xauusd_m1.csv
+data/xauusd_m5.csv
+data/xauusd_m15.csv
+
+# Outputs (Models, logs)
+outputs/
+logs/
+checkpoints/
+
+# IDE
+.vscode/
+.idea/

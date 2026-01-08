@@ -1,0 +1,19 @@
+XAU-SNIPER DIAGNOSTIC REPORT
+============================================================
+Generated: 2026-01-07 01:32:28
+
+FINAL METRICS:
+  Avg Return: -0.09%
+  Avg Sharpe: -1.271
+  Avg Trades: 6.5
+  Trades/Week: 6.5
+  Win Rate: 53.7%
+
+ACTION DISTRIBUTION:
+  Action 0: 164,510 (32.8%)
+  Action 1: 168,442 (33.6%)
+  Action 2: 168,808 (33.6%)
+
+EPISODES COMPLETED: 4181
+  Best Reward: 3584.1825
+  Improvements: 10

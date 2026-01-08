@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python diagnostics/run_diagnostic.py:*)",
+      "Bash(where:*)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(python -m pip:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:medium.com)"
+    ]
+  }
+}
