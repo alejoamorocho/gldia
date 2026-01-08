@@ -532,6 +532,8 @@ if __name__ == "__main__":
                        help="Random seed")
     parser.add_argument("--resume", type=str, default=None,
                        help="Path to resume training from")
+    parser.add_argument("--save_freq", type=int, default=50_000,
+                       help="Model checkpoint frequency")
 
     args = parser.parse_args()
 
@@ -540,6 +542,7 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         total_timesteps=args.timesteps,
         eval_freq=args.eval_freq,
+        save_freq=args.save_freq,
         seed=args.seed,
         resume_path=args.resume
     )
