@@ -431,9 +431,17 @@ def evaluate_model(model, env, n_episodes: int = 10, run_dir: str = None):
 
         # EXTRACT TRADES BEFORE RESET
         # Need to unwrap env to get trade history
-        inner_env = env.envs[0]
-        while hasattr(inner_env, 'env'):
+        inner_env = env
+        if hasattr(env, 'envs'):
+            inner_env = env.envs[0]
+            
+        while hasattr(inner_env, 'env') and not isinstance(inner_env, GoldEnv):
             inner_env = inner_env.env
+            
+        # Fallback for deep wrapping if GoldEnv still not found directly
+        # But allow accessing if it has risk_manager
+        while hasattr(inner_env, 'env') and not hasattr(inner_env, 'risk_manager'):
+             inner_env = inner_env.env
         
         if hasattr(inner_env, 'risk_manager') and inner_env.risk_manager.trade_history:
             current_ep_trades = inner_env.risk_manager.trade_history
