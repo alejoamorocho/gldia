@@ -4,8 +4,6 @@ __pycache__/
 *$py.class
 *.so
 .env
-.venv
-env/
 venv/
 Lib/
 Scripts/
