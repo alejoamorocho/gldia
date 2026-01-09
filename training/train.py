@@ -349,7 +349,11 @@ def analyze_and_report(trades_df: pd.DataFrame, report_name: str, run_dir: str):
         wins = y_trades[y_trades['pnl'] > 0]
         losses = y_trades[y_trades['pnl'] <= 0]
         
-        win_rate = (len(wins) / count) * 100
+        if count > 0:
+            win_rate = (len(wins) / count) * 100
+        else:
+            win_rate = 0.0
+        
         total_pnl = y_trades['pnl'].sum()
         avg_pnl = y_trades['pnl'].mean()
         
@@ -380,7 +384,11 @@ def analyze_and_report(trades_df: pd.DataFrame, report_name: str, run_dir: str):
             wins = y_trades[y_trades['pnl'] > 0]
             losses = y_trades[y_trades['pnl'] <= 0]
             
-            win_rate = (len(wins) / count) * 100
+            if count > 0:
+                win_rate = (len(wins) / count) * 100
+            else:
+                win_rate = 0.0
+                
             total_pnl = y_trades['pnl'].sum()
             avg_pnl = y_trades['pnl'].mean()
             
