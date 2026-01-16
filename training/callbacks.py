@@ -218,31 +218,34 @@ class SaveBestCallback(BaseCallback):
 
     def _check_and_save(self):
         """Check metric and save if improved."""
+        # Fix: Unwrap to find GoldEnv, whether it is DummyVecEnv, Monitor, etc
         env = self.training_env.envs[0]
+        while hasattr(env, 'env'):
+            env = env.env
+        # Also check for 'unwrapped' attribute if it's a specific wrapper
+        if hasattr(env, 'unwrapped'):
+            env = env.unwrapped
 
         try:
-            stats = env.get_episode_stats()
+            if hasattr(env, 'get_episode_stats'):
+                stats = env.get_episode_stats()
 
-            if self.metric == 'sharpe':
-                current_value = stats.get('sharpe_ratio', -np.inf)
-            elif self.metric == 'return':
-                current_value = stats.get('total_return', -np.inf)
-            elif self.metric == 'profit_factor':
-                current_value = stats.get('profit_factor', -np.inf)
+                if self.metric == 'sharpe':
+                    current_value = stats.get('sharpe_ratio', -np.inf)
+                elif self.metric == 'return':
+                    current_value = stats.get('total_return', -np.inf)
+                elif self.metric == 'profit_factor':
+                    current_value = stats.get('profit_factor', -np.inf)
+                else:
+                    current_value = -np.inf
+
+                if current_value > self.best_value:
+                    self.best_value = current_value
+                    self.model.save(self.save_path)
+                    if self.verbose > 0:
+                        logger.info(f"New best {self.metric}: {current_value:.4f}. Model saved.")
             else:
-                current_value = -np.inf
-
-            if current_value > self.best_value:
-                self.best_value = current_value
-
-                # Save model
-                self.model.save(self.save_path)
-
-                if self.verbose > 0:
-                    logger.info(
-                        f"New best {self.metric}: {current_value:.4f}. "
-                        f"Model saved to {self.save_path}"
-                    )
+                 pass # Cannot get stats
 
         except Exception as e:
             if self.verbose > 0:

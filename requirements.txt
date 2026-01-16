@@ -34,3 +34,10 @@ yfinance>=0.2.28
 pytest>=7.0.0
 black>=23.0.0
 isort>=5.12.0
+
+# Live Trading (MT5)
+MetaTrader5>=5.0.45  # Windows only
+rich>=13.0.0         # Beautiful terminal output
+textual>=0.50.0      # TUI dashboard
+structlog>=23.0.0    # Structured logging
+plotext>=5.2.0       # ASCII charts

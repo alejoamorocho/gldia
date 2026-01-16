@@ -302,7 +302,7 @@ class RiskManager:
 
             # Check panic exit (extreme volume)
             if current_volume > self.avg_volume * self.config.panic_volume_multiplier:
-                _, reason, pnl = self._close_specific_position(pos, current_price, "PANIC")
+                _, reason, pnl = self._close_specific_position(pos, current_price, "PANIC", False, current_date, features)
                 total_pnl += pnl
                 closed_any = True
                 last_reason = "PANIC"
@@ -311,7 +311,7 @@ class RiskManager:
             # Check stop loss
             if self._check_stop_loss(pos, current_low, current_high):
                 exit_price = pos.stop_loss
-                _, reason, pnl = self._close_specific_position(pos, exit_price, "STOP_LOSS")
+                _, reason, pnl = self._close_specific_position(pos, exit_price, "STOP_LOSS", False, current_date, features)
                 total_pnl += pnl
                 closed_any = True
                 last_reason = "STOP_LOSS"
@@ -485,15 +485,20 @@ class RiskManager:
         total_wins = sum(wins) if wins else 0
         total_losses = abs(sum(losses)) if losses else 0
 
+        # Calculate with nan protection
+        avg_pnl = np.mean(pnls) if pnls else 0.0
+        avg_duration = np.mean([t['duration_bars'] for t in self.trade_history]) if self.trade_history else 0.0
+        profit_factor = total_wins / total_losses if total_losses > 0 else (999.99 if total_wins > 0 else 0.0)
+
         return {
             'total_trades': len(self.trade_history),
             'win_rate': len(wins) / len(self.trade_history) if self.trade_history else 0.0,
-            'avg_pnl': np.mean(pnls),
-            'total_pnl': sum(pnls),
+            'avg_pnl': avg_pnl if not np.isnan(avg_pnl) else 0.0,
+            'total_pnl': sum(pnls) if pnls else 0.0,
             'total_gains': total_wins,  # Exposed for reporting
-            'total_losses': total_losses, # Exposed for reporting
-            'profit_factor': total_wins / total_losses if total_losses > 0 else float('inf'),
-            'avg_duration': np.mean([t['duration_bars'] for t in self.trade_history])
+            'total_losses': total_losses,  # Exposed for reporting
+            'profit_factor': profit_factor,
+            'avg_duration': avg_duration if not np.isnan(avg_duration) else 0.0
         }
 
 

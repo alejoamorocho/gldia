@@ -255,6 +255,32 @@ def add_features_h1(
     df['rsi_divergence'] = np.sign(price_change_20) * np.sign(rsi_change_20) * -1  # -1 = divergence
 
     # =========================================================================
+    # 4b. RSI DYNAMIC (Adaptive Levels based on volatility)
+    # =========================================================================
+    # Dynamic RSI adjusts overbought/oversold levels based on recent RSI volatility
+    # In high volatility: wider bands (more extreme levels needed)
+    # In low volatility: tighter bands (smaller moves are significant)
+
+    rsi_std = rsi.rolling(50).std()  # RSI volatility
+    rsi_mean = rsi.rolling(50).mean()  # RSI mean reversion level
+
+    # Adaptive levels: mean +/- 1.5 * std (capped at 20-80 range)
+    rsi_dynamic_upper = (rsi_mean + 1.5 * rsi_std).clip(60, 85)
+    rsi_dynamic_lower = (rsi_mean - 1.5 * rsi_std).clip(15, 40)
+
+    # RSI position relative to dynamic bands [-1 to +1]
+    # -1 = at/below dynamic oversold, +1 = at/above dynamic overbought
+    rsi_range = rsi_dynamic_upper - rsi_dynamic_lower
+    df['rsi_dynamic'] = ((rsi - rsi_dynamic_lower) / rsi_range.replace(0, np.nan) * 2 - 1).clip(-1, 1)
+
+    # Dynamic oversold/overbought signals
+    df['rsi_dynamic_oversold'] = (rsi < rsi_dynamic_lower).astype(float)
+    df['rsi_dynamic_overbought'] = (rsi > rsi_dynamic_upper).astype(float)
+
+    # RSI vs its own mean (mean reversion signal)
+    df['rsi_vs_mean'] = ((rsi - rsi_mean) / rsi_std.replace(0, np.nan)).clip(-3, 3) / 3
+
+    # =========================================================================
     # 5. MACD GOLD-OPTIMIZED (16/34/13)
     # =========================================================================
 
@@ -335,6 +361,12 @@ def add_features_h1(
     df['is_overlap'] = ((hour >= 13) & (hour < 16)).astype(float)  # London/NY overlap - high volatility
     df['is_asia'] = ((hour >= 0) & (hour < 7)).astype(float)  # Low volatility
 
+    # Week start indicator (Monday first 8 hours - market just opened after weekend)
+    df['is_week_start'] = ((dow == 0) & (hour < 8)).astype(float)
+
+    # Week end indicator (Friday last 4 hours - approaching weekend close)
+    df['is_week_end'] = ((dow == 4) & (hour >= 20)).astype(float)
+
     # =========================================================================
     # 8. PRICE ACTION FEATURES
     # =========================================================================
@@ -387,6 +419,34 @@ def add_features_h1(
     # Price position in range [0, 1]
     range_size = high_20 - low_20
     df['price_position'] = ((close - low_20) / range_size.replace(0, np.nan)).clip(0, 1)
+
+    # =========================================================================
+    # 10b. BOLLINGER BANDS
+    # =========================================================================
+    # Bollinger Bands: Mean reversion and volatility squeeze detection
+
+    bb_period = 20
+    bb_std_mult = 2.0
+
+    bb_middle = close.rolling(bb_period).mean()
+    bb_std = close.rolling(bb_period).std()
+    bb_upper = bb_middle + (bb_std * bb_std_mult)
+    bb_lower = bb_middle - (bb_std * bb_std_mult)
+
+    # BB Position: Where is price within the bands? [0 = lower band, 1 = upper band]
+    bb_range = bb_upper - bb_lower
+    df['bb_position'] = ((close - bb_lower) / bb_range.replace(0, np.nan)).clip(0, 1)
+
+    # BB Width: Band width as % of price (volatility measure)
+    # Narrow bands = low volatility (squeeze), wide bands = high volatility
+    df['bb_width'] = (bb_range / bb_middle).clip(0, 0.1) * 10  # Normalized to ~[0, 1]
+
+    # BB Squeeze: Is volatility contracting? (potential breakout coming)
+    bb_width_ma = df['bb_width'].rolling(50).mean()
+    df['bb_squeeze'] = (df['bb_width'] < bb_width_ma * 0.8).astype(float)
+
+    # Price vs BB middle (trend strength within bands)
+    df['bb_trend'] = ((close - bb_middle) / (bb_std.replace(0, np.nan))).clip(-2, 2) / 2
 
     # =========================================================================
     # 11. MACRO FEATURES (DXY correlation)
@@ -493,16 +553,37 @@ def _add_macro_features(df: pd.DataFrame, macro_df: pd.DataFrame, prefix: str) -
     # Calculate returns and momentum
     m_df[f'{prefix}_ret'] = m_df['close'].pct_change() * 10
     m_df[f'{prefix}_mom5'] = m_df['close'].pct_change(5) * 10
-    
+
     # Trend vs 20-day MA
     ma20 = m_df['close'].rolling(20).mean()
     m_df[f'{prefix}_trend'] = np.sign(m_df['close'] - ma20)
+
+    # Special features for US10Y (Treasury Yields)
+    feature_cols = [f'{prefix}_ret', f'{prefix}_mom5', f'{prefix}_trend']
+
+    if prefix == 'us10y':
+        # US10Y Level normalized (typical range 1-5%, normalize to [-1, 1])
+        # Historical range: ~0.5% (2020 lows) to ~5% (2023 highs)
+        # Normalize: (yield - 2.5) / 2.5 -> -1 at 0%, 0 at 2.5%, +1 at 5%
+        m_df['us10y_level'] = ((m_df['close'] - 2.5) / 2.5).clip(-1, 1)
+
+        # Real Yield Proxy: US10Y - Expected Inflation (using 2% as Fed target)
+        # Positive real yield = headwind for gold, Negative = tailwind
+        # Normalize: real_yield / 2 (so +2% real yield = +1, -2% = -1)
+        expected_inflation = 2.0  # Fed's long-term target
+        m_df['real_yield'] = ((m_df['close'] - expected_inflation) / 2.0).clip(-1, 1)
+
+        # Real Yield Change (momentum in real yields)
+        m_df['real_yield_mom'] = m_df['real_yield'].diff(5) * 5  # 5-day change scaled
+        m_df['real_yield_mom'] = m_df['real_yield_mom'].clip(-1, 1)
+
+        feature_cols.extend(['us10y_level', 'real_yield', 'real_yield_mom'])
 
     # Force main df index to be compatible
     df.index = pd.to_datetime(df.index, utc=True).tz_localize(None)
 
     # Resample to match H1 index
-    macro_features = m_df[[f'{prefix}_ret', f'{prefix}_mom5', f'{prefix}_trend']].reindex(df.index, method='ffill')
+    macro_features = m_df[feature_cols].reindex(df.index, method='ffill')
 
     # Merge
     for col in macro_features.columns:
@@ -535,6 +616,12 @@ def get_feature_columns() -> List[str]:
         'rsi_extreme_overbought',
         'rsi_divergence',
 
+        # RSI Dynamic (Adaptive Levels)
+        'rsi_dynamic',
+        'rsi_dynamic_oversold',
+        'rsi_dynamic_overbought',
+        'rsi_vs_mean',
+
         # MACD Gold-Optimized (16/34/13)
         'macd_norm',
         'macd_signal_norm',
@@ -559,6 +646,8 @@ def get_feature_columns() -> List[str]:
         'is_newyork',
         'is_overlap',
         'is_asia',
+        'is_week_start',
+        'is_week_end',
 
         # Price action
         'body_ratio',
@@ -569,19 +658,26 @@ def get_feature_columns() -> List[str]:
         'consec_down',
 
         # Volatility regime
+        'vol_20',
+        'vol_50',
         'vol_regime',
         'high_vol',
 
         # Support/Resistance
         'dist_high_20',
         'dist_low_20',
-        'dist_high_20',
-        'dist_low_20',
         'price_position',
+
+        # Bollinger Bands
+        'bb_position',
+        'bb_width',
+        'bb_squeeze',
+        'bb_trend',
 
         # Macro
         'dxy_ret', 'dxy_mom5', 'dxy_trend',
         'us10y_ret', 'us10y_mom5', 'us10y_trend',
+        'us10y_level', 'real_yield', 'real_yield_mom',
         'vix_ret', 'vix_mom5', 'vix_trend',
 
         # Economic Calendar

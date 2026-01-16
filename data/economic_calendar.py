@@ -73,7 +73,7 @@ class EconomicCalendar:
         Args:
             calendar_file: Path to JSON file with events (optional)
         """
-        self.calendar_file = calendar_file or "data/economic_events.json"
+        self.calendar_file = calendar_file or "data/economic_events_2015_2025.json"
         self.events = self.load_calendar()
 
         logger.info(f"📅 Economic Calendar initialized with {len(self.events)} events")
@@ -193,11 +193,18 @@ class EconomicCalendar:
         - event_volatility_forecast: Expected volatility multiplier
         """
 
-        # Convert to datetime if needed
+        # Convert to datetime if needed and make timezone-naive for comparison
         if isinstance(current_time, str):
             current_time = pd.to_datetime(current_time)
-        elif isinstance(current_time, pd.Timestamp):
+
+        if isinstance(current_time, pd.Timestamp):
+            # Remove timezone if present
+            if current_time.tz is not None:
+                current_time = current_time.tz_localize(None)
             current_time = current_time.to_pydatetime()
+        elif hasattr(current_time, 'tzinfo') and current_time.tzinfo is not None:
+            # For datetime objects with timezone
+            current_time = current_time.replace(tzinfo=None)
 
         # Find upcoming events
         upcoming_events = [e for e in self.events if e['datetime'] > current_time]
@@ -318,8 +325,14 @@ class EconomicCalendar:
 
         if isinstance(current_time, str):
             current_time = pd.to_datetime(current_time)
-        elif isinstance(current_time, pd.Timestamp):
+
+        # Make timezone-naive for comparison
+        if isinstance(current_time, pd.Timestamp):
+            if current_time.tz is not None:
+                current_time = current_time.tz_localize(None)
             current_time = current_time.to_pydatetime()
+        elif hasattr(current_time, 'tzinfo') and current_time.tzinfo is not None:
+            current_time = current_time.replace(tzinfo=None)
 
         end_time = current_time + timedelta(days=days_ahead)
 
@@ -361,13 +374,47 @@ def add_calendar_features_to_dataframe(df, calendar=None):
     for feat in feature_names:
         df[feat] = 0.0
 
-    # Compute features for each timestamp
-    for idx, row in df.iterrows():
-        timestamp = row['time']
-        features = calendar.get_features(timestamp)
+    # Get time values - handle both column and index cases
+    # Always convert to Series for consistent .iloc access
+    if 'time' in df.columns:
+        time_col = pd.to_datetime(df['time']).reset_index(drop=True)
+    elif isinstance(df.index, pd.DatetimeIndex):
+        time_col = pd.Series(df.index.values, index=range(len(df)))
+    else:
+        time_col = pd.Series(pd.to_datetime(df.index).values, index=range(len(df)))
 
-        for feat_name, feat_value in features.items():
-            df.loc[idx, feat_name] = feat_value
+    # Convert to timezone-naive datetime for comparison
+    if hasattr(time_col, 'dt') and time_col.dt.tz is not None:
+        time_col = time_col.dt.tz_localize(None)
+
+    # Vectorized approach: Sort events by datetime for efficient lookup
+    events_sorted = sorted(calendar.events, key=lambda e: e['datetime'])
+
+    # For large dataframes, use a more efficient approach
+    # Process in batches and cache event lookups
+    total_rows = len(df)
+    batch_size = 10000
+
+    for batch_start in range(0, total_rows, batch_size):
+        batch_end = min(batch_start + batch_size, total_rows)
+
+        for i in range(batch_start, batch_end):
+            idx = df.index[i]
+            timestamp = time_col.iloc[i]
+
+            # Convert to Python datetime for comparison
+            if isinstance(timestamp, pd.Timestamp):
+                timestamp = timestamp.to_pydatetime()
+
+            features = calendar.get_features(timestamp)
+
+            for feat_name, feat_value in features.items():
+                df.at[idx, feat_name] = feat_value
+
+        # Progress logging for large datasets
+        if total_rows > batch_size:
+            progress = (batch_end / total_rows) * 100
+            logger.info(f"📅 Calendar features progress: {progress:.1f}%")
 
     logger.info(f"✅ Added {len(feature_names)} calendar features")
 

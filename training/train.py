@@ -197,14 +197,15 @@ def train_agent(
     # Get feature columns
     feature_columns = get_feature_columns()
 
-    # Risk configuration
+    # Risk configuration - 1:1 R:R with trailing for extended gains
     risk_config = RiskConfig(
-        tp_target=0.005,      # 0.5% target (was 0.3%)
-        sl_initial=0.0025,    # 0.25% stop (was 0.15%)
-        trailing_distance=0.0015,
-        commission=0.00005,   # 0.5 pips (was 0.5!)
-        slippage=0.0002,      # 2 pips (was 0.3!)
-        use_atr_stops=True    # Enable dynamic stops
+        tp_target=0.003,      # 0.3% target (triggers trailing)
+        sl_initial=0.003,     # 0.3% stop (1:1 ratio)
+        trailing_distance=0.0015,  # 0.15% trailing distance
+        breakeven_level=0.0015,    # 0.15% breakeven buffer after TP
+        commission=0.00005,   # 0.5 pips
+        slippage=0.0002,      # 2 pips
+        use_atr_stops=False   # Use fixed % stops (more consistent)
     )
 
     # Create environments
@@ -268,9 +269,21 @@ def train_agent(
     model.save(final_path)
     logger.info(f"Saved final model to {final_path}")
 
-    # Final evaluation (Test Set - 2024-2025)
-    logger.info("Running standard evaluation (Test Set)...")
-    _, trades_test = evaluate_model(model, eval_env, n_episodes=10, run_dir=run_dir)
+    # Final evaluation (Test Set - 2023-2025)
+    # Use 1 episode covering the FULL eval period to avoid duplicates
+    logger.info("Running TEST SET evaluation (2023-2025)...")
+
+    # Create test env that covers full eval period (no randomization, no overlap)
+    test_env = GoldEnv(
+        df_h1=eval_h1,
+        df_m1=eval_m1,
+        feature_columns=feature_columns,
+        risk_config=risk_config,
+        episode_length=len(eval_h1),  # Cover FULL eval period
+        randomize_start=False  # Start from beginning
+    )
+
+    _, trades_test = evaluate_model(model, test_env, n_episodes=1, run_dir=run_dir)
     analyze_and_report(trades_test, "TEST_SET", run_dir)
 
     # Full Backtest (2015-2025)
@@ -313,114 +326,221 @@ def train_agent(
 
 def analyze_and_report(trades_df: pd.DataFrame, report_name: str, run_dir: str):
     """
-    Generate detailed Monthly and Annual report from trades DataFrame.
+    Generate detailed Annual report from trades DataFrame.
+    EXHAUSTIVE VERSION - All metrics calculated from single source of truth.
     """
-    if trades_df.empty:
+    if trades_df is None or trades_df.empty:
+        logger.warning(f"No trades to analyze for {report_name}")
         return
 
-    logger.info(f"\n Generating Advanced Report: {report_name} ")
-    logger.info("=" * 60)
+    logger.info(f"\n{'='*80}")
+    logger.info(f"COMPREHENSIVE REPORT: {report_name}")
+    logger.info(f"{'='*80}")
 
-    # Ensure exit_date is datetime
-    # Try different parsing strategies since 'exit_date' comes from str(current_time)
-    try:
-        trades_df['exit_dt'] = pd.to_datetime(trades_df['exit_date'], utc=True)
-    except Exception as e:
-        logger.error(f"Could not parse dates: {e}")
+    # =========================================================================
+    # 1. PARSE DATES - Handle all formats
+    # =========================================================================
+    trades_df = trades_df.copy()
+
+    # Try multiple parsing strategies
+    if 'exit_dt' not in trades_df.columns:
+        for date_col in ['exit_date', 'entry_date']:
+            if date_col in trades_df.columns:
+                try:
+                    trades_df['exit_dt'] = pd.to_datetime(trades_df[date_col], utc=True, errors='coerce')
+                    if trades_df['exit_dt'].notna().sum() > 0:
+                        break
+                except:
+                    try:
+                        trades_df['exit_dt'] = pd.to_datetime(trades_df[date_col], errors='coerce')
+                        if trades_df['exit_dt'].notna().sum() > 0:
+                            break
+                    except:
+                        continue
+
+    # Filter valid trades
+    if 'exit_dt' not in trades_df.columns or trades_df['exit_dt'].isna().all():
+        logger.error("Could not parse any dates from trades")
         return
 
-    trades_df['year'] = trades_df['exit_dt'].dt.year
-    trades_df['month'] = trades_df['exit_dt'].dt.month
+    valid_trades = trades_df[trades_df['exit_dt'].notna()].copy()
+    invalid_count = len(trades_df) - len(valid_trades)
 
-    # Annual Stats
-    annual_stats = []
-    years = sorted(trades_df['year'].unique())
-    
-    print("\nANNUAL PERFORMANCE:")
-    print("-" * 80)
-    print(f"{'Year':<6} | {'Trades':<6} | {'Win%':<6} | {'Profit Factor':<13} | {'Total PnL':<10} | {'Avg PnL':<8}")
-    print("-" * 80)
+    if invalid_count > 0:
+        logger.warning(f"  {invalid_count} trades had invalid dates and were excluded")
 
+    if len(valid_trades) == 0:
+        logger.warning("No valid trades found")
+        return
+
+    # Add year/month columns
+    valid_trades['year'] = valid_trades['exit_dt'].dt.year.astype(int)
+    valid_trades['month'] = valid_trades['exit_dt'].dt.month.astype(int)
+
+    # =========================================================================
+    # 2. CALCULATE GLOBAL METRICS (from trades_df - single source of truth)
+    # =========================================================================
+    total_trades = len(valid_trades)
+    wins = valid_trades[valid_trades['pnl'] > 0]
+    losses = valid_trades[valid_trades['pnl'] <= 0]
+
+    win_rate = (len(wins) / total_trades * 100) if total_trades > 0 else 0.0
+    total_pnl = valid_trades['pnl'].sum()
+    avg_pnl = valid_trades['pnl'].mean() if total_trades > 0 else 0.0
+
+    gross_wins = wins['pnl'].sum() if len(wins) > 0 else 0.0
+    gross_losses = abs(losses['pnl'].sum()) if len(losses) > 0 else 0.0
+    profit_factor = gross_wins / gross_losses if gross_losses > 0 else (999.99 if gross_wins > 0 else 0.0)
+
+    avg_win = wins['pnl'].mean() if len(wins) > 0 else 0.0
+    avg_loss = losses['pnl'].mean() if len(losses) > 0 else 0.0
+    max_win = valid_trades['pnl'].max() if total_trades > 0 else 0.0
+    max_loss = valid_trades['pnl'].min() if total_trades > 0 else 0.0
+
+    # Calculate date range and trades per year
+    min_date = valid_trades['exit_dt'].min()
+    max_date = valid_trades['exit_dt'].max()
+    date_range_years = (max_date - min_date).days / 365.25
+    trades_per_year = total_trades / date_range_years if date_range_years > 0 else total_trades
+
+    # Exit reasons breakdown
+    exit_reasons = valid_trades['exit_reason'].value_counts() if 'exit_reason' in valid_trades.columns else pd.Series()
+
+    # =========================================================================
+    # 3. PRINT GLOBAL SUMMARY
+    # =========================================================================
+    print(f"\n{'='*80}")
+    print(f"SUMMARY: {report_name}")
+    print(f"{'='*80}")
+    print(f"Date Range:       {min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')} ({date_range_years:.1f} years)")
+    print(f"Total Trades:     {total_trades}")
+    print(f"Trades/Year:      {trades_per_year:.1f}")
+    print(f"Win Rate:         {win_rate:.1f}%")
+    print(f"Profit Factor:    {profit_factor:.2f}")
+    print(f"Total PnL:        ${total_pnl:.2f}")
+    print(f"Avg PnL/Trade:    ${avg_pnl:.2f}")
+    print(f"Avg Win:          ${avg_win:.2f}")
+    print(f"Avg Loss:         ${avg_loss:.2f}")
+    print(f"Largest Win:      ${max_win:.2f}")
+    print(f"Largest Loss:     ${max_loss:.2f}")
+
+    if len(exit_reasons) > 0:
+        print(f"\nExit Reasons:")
+        for reason, count in exit_reasons.items():
+            pct = count / total_trades * 100
+            print(f"  {reason:<12}: {count:>5} ({pct:.1f}%)")
+
+    # =========================================================================
+    # 4. ANNUAL PERFORMANCE TABLE
+    # =========================================================================
+    years = sorted(valid_trades['year'].unique())
+
+    print(f"\n{'='*80}")
+    print("ANNUAL PERFORMANCE:")
+    print(f"{'='*80}")
+    print(f"{'Year':<6} | {'Trades':<7} | {'Win%':<6} | {'PF':<8} | {'Total PnL':<12} | {'Avg PnL':<10} | {'MaxWin':<10} | {'MaxLoss':<10}")
+    print("-" * 90)
+
+    annual_data = []
     for y in years:
-        mask = trades_df['year'] == y
-        y_trades = trades_df[mask]
-        
-        count = len(y_trades)
-        wins = y_trades[y_trades['pnl'] > 0]
-        losses = y_trades[y_trades['pnl'] <= 0]
-        
-        if count > 0:
-            win_rate = (len(wins) / count) * 100
-        else:
-            win_rate = 0.0
-        
-        total_pnl = y_trades['pnl'].sum()
-        avg_pnl = y_trades['pnl'].mean()
-        
-        gross_win = wins['pnl'].sum()
-        gross_loss = abs(losses['pnl'].sum())
-        pf = gross_win / gross_loss if gross_loss > 0 else float('inf')
-        
-        print(f"{y:<6} | {count:<6} | {win_rate:<6.1f} | {pf:<13.2f} | {total_pnl:<10.2f} | {avg_pnl:<8.2f}")
-        
-    print("-" * 80)
-    
-    # Save report to file
+        y_trades = valid_trades[valid_trades['year'] == y]
+        y_wins = y_trades[y_trades['pnl'] > 0]
+        y_losses = y_trades[y_trades['pnl'] <= 0]
+
+        y_count = len(y_trades)
+        y_win_rate = (len(y_wins) / y_count * 100) if y_count > 0 else 0.0
+        y_total_pnl = y_trades['pnl'].sum()
+        y_avg_pnl = y_trades['pnl'].mean() if y_count > 0 else 0.0
+
+        y_gross_win = y_wins['pnl'].sum() if len(y_wins) > 0 else 0.0
+        y_gross_loss = abs(y_losses['pnl'].sum()) if len(y_losses) > 0 else 0.0
+        y_pf = y_gross_win / y_gross_loss if y_gross_loss > 0 else (999.99 if y_gross_win > 0 else 0.0)
+
+        y_max_win = y_trades['pnl'].max() if y_count > 0 else 0.0
+        y_max_loss = y_trades['pnl'].min() if y_count > 0 else 0.0
+
+        # Handle nan
+        y_avg_pnl = 0.0 if pd.isna(y_avg_pnl) else y_avg_pnl
+        y_total_pnl = 0.0 if pd.isna(y_total_pnl) else y_total_pnl
+
+        print(f"{y:<6} | {y_count:<7} | {y_win_rate:<6.1f} | {y_pf:<8.2f} | ${y_total_pnl:<11.2f} | ${y_avg_pnl:<9.2f} | ${y_max_win:<9.2f} | ${y_max_loss:<9.2f}")
+
+        annual_data.append({
+            'year': y, 'trades': y_count, 'win_rate': y_win_rate,
+            'profit_factor': y_pf, 'total_pnl': y_total_pnl, 'avg_pnl': y_avg_pnl,
+            'max_win': y_max_win, 'max_loss': y_max_loss
+        })
+
+    # TOTAL ROW
+    print("-" * 90)
+    print(f"{'TOTAL':<6} | {total_trades:<7} | {win_rate:<6.1f} | {profit_factor:<8.2f} | ${total_pnl:<11.2f} | ${avg_pnl:<9.2f} | ${max_win:<9.2f} | ${max_loss:<9.2f}")
+    print(f"{'='*80}")
+
+    # =========================================================================
+    # 5. SAVE TO FILE
+    # =========================================================================
     report_path = os.path.join(run_dir, f"report_{report_name}.txt")
-    with open(report_path, "w") as f:
-        f.write(f"ADVANCED REPORT: {report_name}\n")
-        f.write("=" * 60 + "\n\n")
-        
-        f.write("ANNUAL PERFORMANCE:\n")
-        f.write("-" * 80 + "\n")
-        f.write(f"{'Year':<6} | {'Trades':<6} | {'Win%':<6} | {'Profit Factor':<13} | {'Total PnL':<10} | {'Avg PnL':<8}\n")
-        f.write("-" * 80 + "\n")
-        
-        for y in years:
-            mask = trades_df['year'] == y
-            y_trades = trades_df[mask]
-            
-            count = len(y_trades)
-            wins = y_trades[y_trades['pnl'] > 0]
-            losses = y_trades[y_trades['pnl'] <= 0]
-            
-            if count > 0:
-                win_rate = (len(wins) / count) * 100
-            else:
-                win_rate = 0.0
-                
-            total_pnl = y_trades['pnl'].sum()
-            avg_pnl = y_trades['pnl'].mean()
-            
-            gross_win = wins['pnl'].sum()
-            gross_loss = abs(losses['pnl'].sum())
-            pf = gross_win / gross_loss if gross_loss > 0 else float('inf')
-            
-            line = f"{y:<6} | {count:<6} | {win_rate:<6.1f} | {pf:<13.2f} | {total_pnl:<10.2f} | {avg_pnl:<8.2f}\n"
-            f.write(line)
-            
-        f.write("-" * 80 + "\n")
+    with open(report_path, "w", encoding='utf-8') as f:
+        f.write(f"COMPREHENSIVE REPORT: {report_name}\n")
+        f.write(f"{'='*80}\n\n")
+
+        f.write(f"SUMMARY\n")
+        f.write(f"{'-'*40}\n")
+        f.write(f"Date Range:       {min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')} ({date_range_years:.1f} years)\n")
+        f.write(f"Total Trades:     {total_trades}\n")
+        f.write(f"Trades/Year:      {trades_per_year:.1f}\n")
+        f.write(f"Win Rate:         {win_rate:.1f}%\n")
+        f.write(f"Profit Factor:    {profit_factor:.2f}\n")
+        f.write(f"Total PnL:        ${total_pnl:.2f}\n")
+        f.write(f"Avg PnL/Trade:    ${avg_pnl:.2f}\n")
+        f.write(f"Avg Win:          ${avg_win:.2f}\n")
+        f.write(f"Avg Loss:         ${avg_loss:.2f}\n")
+        f.write(f"Largest Win:      ${max_win:.2f}\n")
+        f.write(f"Largest Loss:     ${max_loss:.2f}\n\n")
+
+        if len(exit_reasons) > 0:
+            f.write(f"Exit Reasons:\n")
+            for reason, count in exit_reasons.items():
+                pct = count / total_trades * 100
+                f.write(f"  {reason:<12}: {count:>5} ({pct:.1f}%)\n")
+            f.write("\n")
+
+        f.write(f"ANNUAL PERFORMANCE\n")
+        f.write(f"{'-'*90}\n")
+        f.write(f"{'Year':<6} | {'Trades':<7} | {'Win%':<6} | {'PF':<8} | {'Total PnL':<12} | {'Avg PnL':<10} | {'MaxWin':<10} | {'MaxLoss':<10}\n")
+        f.write(f"{'-'*90}\n")
+
+        for row in annual_data:
+            f.write(f"{row['year']:<6} | {row['trades']:<7} | {row['win_rate']:<6.1f} | {row['profit_factor']:<8.2f} | ${row['total_pnl']:<11.2f} | ${row['avg_pnl']:<9.2f} | ${row['max_win']:<9.2f} | ${row['max_loss']:<9.2f}\n")
+
+        f.write(f"{'-'*90}\n")
+        f.write(f"{'TOTAL':<6} | {total_trades:<7} | {win_rate:<6.1f} | {profit_factor:<8.2f} | ${total_pnl:<11.2f} | ${avg_pnl:<9.2f} | ${max_win:<9.2f} | ${max_loss:<9.2f}\n")
+        f.write(f"{'='*80}\n")
+
+    # Save annual CSV
+    annual_df = pd.DataFrame(annual_data)
+    annual_path = os.path.join(run_dir, f"annual_{report_name}.csv")
+    annual_df.to_csv(annual_path, index=False)
 
     logger.info(f"Report saved to {report_path}")
+    logger.info(f"Annual CSV saved to {annual_path}")
 
 
 def evaluate_model(model, env, n_episodes: int = 10, run_dir: str = None):
     """
-    Evaluate trained model.
+    Evaluate trained model and collect all trades.
 
-    Args:
-        model: Trained model
-        env: Evaluation environment
-        n_episodes: Number of evaluation episodes
+    Returns trades_df as single source of truth for all metrics.
     """
     all_stats = []
-    super_complete_trades = [] # List to store all trades from all episodes
+    all_trades = []
 
     for ep in range(n_episodes):
         obs, info = env.reset()
         lstm_states = None
         episode_start = True
         done = False
+        step_count = 0
 
         while not done:
             action, lstm_states = model.predict(
@@ -433,102 +553,119 @@ def evaluate_model(model, env, n_episodes: int = 10, run_dir: str = None):
             obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             episode_start = False
+            step_count += 1
 
+            # Progress logging for long episodes
+            if step_count % 10000 == 0:
+                logger.info(f"  Episode {ep+1} progress: {step_count} steps...")
+
+        # Get episode stats (for Sharpe, MaxDD which need equity curve)
         stats = env.get_episode_stats()
         all_stats.append(stats)
 
-        # EXTRACT TRADES BEFORE RESET
-        # Need to unwrap env to get trade history
+        # EXTRACT TRADES - unwrap env to get trade history
         inner_env = env
         if hasattr(env, 'envs'):
             inner_env = env.envs[0]
-            
-        while hasattr(inner_env, 'env') and not isinstance(inner_env, GoldEnv):
-            inner_env = inner_env.env
-            
-        # Fallback for deep wrapping if GoldEnv still not found directly
-        # But allow accessing if it has risk_manager
         while hasattr(inner_env, 'env') and not hasattr(inner_env, 'risk_manager'):
-             inner_env = inner_env.env
-        
+            inner_env = inner_env.env
+
         if hasattr(inner_env, 'risk_manager') and inner_env.risk_manager.trade_history:
-            current_ep_trades = inner_env.risk_manager.trade_history
-            # Append episode number to each trade for tracking
-            for t in current_ep_trades:
-                t['episode'] = ep + 1
-                super_complete_trades.append(t)
+            for t in inner_env.risk_manager.trade_history:
+                trade_copy = t.copy()
+                trade_copy['episode'] = ep + 1
+                all_trades.append(trade_copy)
 
         logger.info(f"Episode {ep+1}: Sharpe={stats['sharpe_ratio']:.3f}, "
                    f"Return={stats['total_return']*100:.2f}%, "
                    f"MaxDD={stats['max_drawdown']*100:.2f}%, "
                    f"Trades={stats['total_trades']}")
 
-    # Average stats
-    avg_sharpe = np.mean([s['sharpe_ratio'] for s in all_stats])
-    avg_return = np.mean([s['total_return'] for s in all_stats])
-    avg_maxdd = np.mean([s['max_drawdown'] for s in all_stats])
-    avg_trades = np.mean([s['total_trades'] for s in all_stats])
-    avg_winrate = np.mean([s['win_rate'] for s in all_stats])
-    
-    # Calculate additional metrics
-    total_gains = sum(s.get('total_gains', 0) for s in all_stats)
-    total_losses = abs(sum(s.get('total_losses', 0) for s in all_stats))
-    profit_factor = total_gains / total_losses if total_losses > 0 else float('inf')
+    # =========================================================================
+    # CREATE TRADES DATAFRAME (single source of truth)
+    # =========================================================================
+    if not all_trades:
+        logger.warning("No trades collected!")
+        return all_stats, pd.DataFrame()
 
-    logger.info("\n" + "=" * 50)
-    logger.info("FINAL EVALUATION REPORT (SUPER COMPLETE)")
-    logger.info("=" * 50)
-    logger.info(f"Avg Sharpe Ratio: {avg_sharpe:.3f}")
-    logger.info(f"Avg Return: {avg_return*100:.2f}%")
-    logger.info(f"Avg Max Drawdown: {avg_maxdd*100:.2f}%")
-    # Scale trades to annual (assuming 2048 hours per episode)
-    # Year = 8760 hours (approx) -> Scale factor = 8760 / 2048 = 4.28
-    avg_trades_annual = avg_trades * (8760 / 2048)
-    logger.info(f"Avg Trades/Year: {avg_trades_annual:.1f} (Avg/Ep: {avg_trades:.1f})")
-    logger.info(f"Avg Win Rate: {avg_winrate*100:.1f}%")
-    logger.info(f"Profit Factor: {profit_factor:.2f}")
-    logger.info("-" * 50)
-    
-    # Save detailed trade history
-    if super_complete_trades:
-        # Flatten nested dictionaries (entry_features, exit_features)
-        flat_trades = []
-        for t in super_complete_trades:
-            flat_t = t.copy()
-            
-            # Flatten entry features
-            if 'entry_features' in t and isinstance(t['entry_features'], dict):
-                for k, v in t['entry_features'].items():
-                    flat_t[f'entry_{k}'] = v
-                del flat_t['entry_features']
-                
-            # Flatten exit features
-            if 'exit_features' in t and isinstance(t['exit_features'], dict):
-                for k, v in t['exit_features'].items():
-                    flat_t[f'exit_{k}'] = v
-                del flat_t['exit_features']
-                
-            flat_trades.append(flat_t)
+    # Flatten nested dictionaries
+    flat_trades = []
+    for t in all_trades:
+        flat_t = t.copy()
+        if 'entry_features' in t and isinstance(t['entry_features'], dict):
+            for k, v in t['entry_features'].items():
+                flat_t[f'entry_{k}'] = v
+            del flat_t['entry_features']
+        if 'exit_features' in t and isinstance(t['exit_features'], dict):
+            for k, v in t['exit_features'].items():
+                flat_t[f'exit_{k}'] = v
+            del flat_t['exit_features']
+        flat_trades.append(flat_t)
 
-        trades_df = pd.DataFrame(flat_trades)
+    trades_df = pd.DataFrame(flat_trades)
+
+    # Save to CSV
+    if run_dir:
         trades_path = os.path.join(run_dir, "evaluation_trades.csv")
         trades_df.to_csv(trades_path, index=False)
-        logger.info(f"Detailed trade history saved to: {trades_path}")
-        
-        # Analyze trades df
-        if not trades_df.empty:
-            avg_win = trades_df[trades_df['pnl'] > 0]['pnl'].mean() if not trades_df[trades_df['pnl'] > 0].empty else 0
-            avg_loss = trades_df[trades_df['pnl'] <= 0]['pnl'].mean() if not trades_df[trades_df['pnl'] <= 0].empty else 0
-            logger.info(f"Avg Win: ${avg_win:.2f}")
-            logger.info(f"Avg Loss: ${avg_loss:.2f}")
-            logger.info(f"Largest Win: ${trades_df['pnl'].max():.2f}")
-            logger.info(f"Largest Loss: ${trades_df['pnl'].min():.2f}")
-        
-            # Count closure reasons
-            logger.info("Exit Reasons:")
-            logger.info(trades_df['exit_reason'].value_counts().to_string())
+        logger.info(f"Trades saved to: {trades_path}")
 
-    logger.info("=" * 50)
+    # =========================================================================
+    # CALCULATE ALL METRICS FROM trades_df (single source of truth)
+    # =========================================================================
+    total_trades = len(trades_df)
+    wins = trades_df[trades_df['pnl'] > 0]
+    losses = trades_df[trades_df['pnl'] <= 0]
+
+    win_rate = len(wins) / total_trades * 100 if total_trades > 0 else 0.0
+    total_pnl = trades_df['pnl'].sum()
+
+    gross_wins = wins['pnl'].sum() if len(wins) > 0 else 0.0
+    gross_losses = abs(losses['pnl'].sum()) if len(losses) > 0 else 0.0
+    profit_factor = gross_wins / gross_losses if gross_losses > 0 else (999.99 if gross_wins > 0 else 0.0)
+
+    avg_win = wins['pnl'].mean() if len(wins) > 0 else 0.0
+    avg_loss = losses['pnl'].mean() if len(losses) > 0 else 0.0
+    max_win = trades_df['pnl'].max() if total_trades > 0 else 0.0
+    max_loss = trades_df['pnl'].min() if total_trades > 0 else 0.0
+
+    # Sharpe and MaxDD from episode stats (need equity curve)
+    def safe_mean(values):
+        clean = [v for v in values if v is not None and not np.isnan(v) and not np.isinf(v)]
+        return np.mean(clean) if clean else 0.0
+
+    avg_sharpe = safe_mean([s['sharpe_ratio'] for s in all_stats])
+    avg_return = safe_mean([s['total_return'] for s in all_stats])
+    avg_maxdd = safe_mean([s['max_drawdown'] for s in all_stats])
+
+    # =========================================================================
+    # PRINT EVALUATION SUMMARY
+    # =========================================================================
+    logger.info("\n" + "=" * 60)
+    logger.info("EVALUATION SUMMARY")
+    logger.info("=" * 60)
+    logger.info(f"Total Trades:     {total_trades}")
+    logger.info(f"Win Rate:         {win_rate:.1f}%")
+    logger.info(f"Profit Factor:    {profit_factor:.2f}")
+    logger.info(f"Total PnL:        ${total_pnl:.2f}")
+    logger.info(f"Avg Win:          ${avg_win:.2f}")
+    logger.info(f"Avg Loss:         ${avg_loss:.2f}")
+    logger.info(f"Largest Win:      ${max_win:.2f}")
+    logger.info(f"Largest Loss:     ${max_loss:.2f}")
+    logger.info(f"-" * 40)
+    logger.info(f"Avg Sharpe:       {avg_sharpe:.3f}")
+    logger.info(f"Avg Return:       {avg_return*100:.2f}%")
+    logger.info(f"Avg Max DD:       {avg_maxdd*100:.2f}%")
+
+    # Exit reasons
+    if 'exit_reason' in trades_df.columns:
+        logger.info(f"-" * 40)
+        logger.info("Exit Reasons:")
+        for reason, count in trades_df['exit_reason'].value_counts().items():
+            pct = count / total_trades * 100
+            logger.info(f"  {reason:<12}: {count:>5} ({pct:.1f}%)")
+
+    logger.info("=" * 60)
 
     return all_stats, trades_df
 

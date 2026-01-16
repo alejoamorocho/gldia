@@ -61,7 +61,7 @@ class GoldEnv(gym.Env):
         render_mode: Optional[str] = None,
         # Sniper parameters
         entry_penalty: float = 0.0,  # Zero penalty to encourage max frequency
-        target_trades_per_week: int = 5,  # Target ~5 trades/week
+        target_trades_per_week: int = 12,  # Target ~12 trades/week (~300/year)
         gold_bullish_bias: float = 0.7,  # Gold is bullish ~70% of time
     ):
         """
@@ -174,6 +174,11 @@ class GoldEnv(gym.Env):
         # Calculate hours per week for trade frequency
         self.hours_per_week = 24 * 5  # 5 trading days
 
+        # Weekly bonus tracking (give bonus ONCE when reaching 5 trades/week)
+        self.weekly_trades_count = 0  # Trades in current week
+        self.current_week_number = -1  # Track which week we're in
+        self.weekly_bonus_given = False  # Has bonus been given this week?
+
         # Differential Sharpe Ratio (Moody & Saffell 1998)
         self.dsr_A = 0.0  # EMA de returns
         self.dsr_B = 0.0  # EMA de returns^2
@@ -186,7 +191,7 @@ class GoldEnv(gym.Env):
 
         # Cooldown: 1 bar H1 despues de cerrar trade (evitar re-entradas impulsivas)
         # Cooldown: 4 bars H1 despues de cerrar trade (e.g. 4 hours)
-        self.cooldown_bars = 4  # Prevent scalping spam, encourage swing-like spacing
+        self.cooldown_bars = 1  # 1 hour cooldown - aggressive for ~300 trades/year target
         self.bars_since_last_close = self.cooldown_bars  # Empieza sin cooldown
 
         logger.info(f"GoldEnv initialized: {len(self.df_h1)} H1 bars, "
@@ -292,6 +297,11 @@ class GoldEnv(gym.Env):
 
         # Reset cooldown
         self.bars_since_last_close = self.cooldown_bars  # Empieza sin cooldown
+
+        # Reset weekly bonus tracking
+        self.weekly_trades_count = 0
+        self.current_week_number = -1
+        self.weekly_bonus_given = False
 
         # Set average volume for risk manager
         self.risk_manager.avg_volume = self.avg_m1_volume
@@ -598,11 +608,48 @@ class GoldEnv(gym.Env):
 
         # 2. PATIENCE REWARD (New) & HOLD REWARDS
         if self.risk_manager.is_flat:
-            # CALIBRATED INACTIVITY PENALTY: Target ~5 trades/week
-            # Start penalizing after 48 hours of inactivity (approx 1 trade every 2 days)
-            if self.steps_since_last_trade > 48:
-                # Penalty slope: -0.0005 per hour
-                reward -= 0.0005 * (self.steps_since_last_trade - 48)
+            # DYNAMIC INACTIVITY THRESHOLD: Adapts to market conditions
+            # More pressure during active sessions, more patience during slow periods
+
+            # Get current time and market conditions from dataframe
+            step_idx = min(self.current_step, len(self.df_h1) - 1)
+            current_bar = self.df_h1.iloc[step_idx]
+            current_dt = self.df_h1.index[step_idx]
+            current_dow = current_dt.dayofweek  # 0=Monday
+            current_hour = current_dt.hour
+
+            # Get session indicators from features
+            is_overlap = current_bar.get('is_overlap', 0.0) > 0.5 if 'is_overlap' in current_bar.index else False
+            is_london = current_bar.get('is_london', 0.0) > 0.5 if 'is_london' in current_bar.index else False
+            is_newyork = current_bar.get('is_newyork', 0.0) > 0.5 if 'is_newyork' in current_bar.index else False
+            is_asia = current_bar.get('is_asia', 0.0) > 0.5 if 'is_asia' in current_bar.index else False
+            atr_ratio = current_bar.get('atr_ratio', 1.0) if 'atr_ratio' in current_bar.index else 1.0
+
+            # DYNAMIC THRESHOLD based on session
+            if is_overlap:
+                inactivity_threshold = 4   # London/NY overlap: high activity, more pressure
+            elif is_london or is_newyork:
+                inactivity_threshold = 6   # Active session: moderate pressure
+            elif is_asia:
+                inactivity_threshold = 16  # Asia: slow market, more patience
+            else:
+                inactivity_threshold = 8   # Default
+
+            # Adjust threshold based on volatility
+            if atr_ratio > 1.2:
+                inactivity_threshold *= 0.75  # High volatility: reduce threshold (more pressure)
+            elif atr_ratio < 0.7:
+                inactivity_threshold *= 1.5   # Low volatility: increase threshold (more patience)
+
+            # Check if we just passed a weekend (Monday early hours)
+            # Don't penalize for weekend gap - market was closed
+            is_monday_morning = (current_dow == 0 and current_hour < 8)
+
+            # Only apply inactivity penalty if NOT monday morning
+            # (because weekend hours don't count as trading opportunity)
+            if self.steps_since_last_trade > inactivity_threshold and not is_monday_morning:
+                # Penalty slope: -0.005 per hour
+                reward -= 0.005 * (self.steps_since_last_trade - inactivity_threshold)
         
         # 3. REWARD/PENALTY POR HOLD CON POSICION ABIERTA
         else:
@@ -643,9 +690,47 @@ class GoldEnv(gym.Env):
                 duration_mult = 1 + (max_duration * 0.05)
                 reward += pnl_pct * 3.0 * duration_mult
 
-        # 4. ENTRY PENALTY
+        # 4. ENTRY PENALTY / ACTION BONUS
         if self.just_opened_trade:
             reward -= self.entry_penalty
+
+            # ACTION BONUS: Small reward for taking action (encourages trading)
+            # BUT only if market conditions are favorable (quality matters)
+            current_bar = self.df_h1.iloc[min(self.current_step, len(self.df_h1) - 1)]
+
+            # Check favorable conditions
+            atr_ok = current_bar.get('atr_ratio', 1.0) >= 0.7 if 'atr_ratio' in current_bar.index else True
+            not_asia = current_bar.get('is_asia', 0.0) < 0.5 if 'is_asia' in current_bar.index else True
+            has_trend = abs(current_bar.get('trend_dir', 0)) > 0 if 'trend_dir' in current_bar.index else True
+
+            # Bonus tiers based on conditions met
+            conditions_met = sum([atr_ok, not_asia, has_trend])
+            if conditions_met >= 3:
+                reward += 0.1  # Good conditions: full bonus
+            elif conditions_met >= 2:
+                reward += 0.05  # Decent conditions: partial bonus
+            # No bonus if conditions are poor (quality control)
+
+            # WEEKLY TARGET BONUS: Reward given ONCE when reaching 5 trades in a week
+            # Get current week number (year * 52 + week_of_year)
+            step_idx = min(self.current_step, len(self.df_h1) - 1)
+            current_dt = self.df_h1.index[step_idx]
+            week_number = current_dt.year * 52 + current_dt.isocalendar()[1]
+
+            # Check if we're in a new week
+            if week_number != self.current_week_number:
+                # New week started - reset counters
+                self.current_week_number = week_number
+                self.weekly_trades_count = 0
+                self.weekly_bonus_given = False
+
+            # Increment weekly trade count
+            self.weekly_trades_count += 1
+
+            # Give bonus ONCE when reaching 5 trades this week
+            if self.weekly_trades_count >= 5 and not self.weekly_bonus_given:
+                reward += 1.0  # Bonus for reaching weekly target
+                self.weekly_bonus_given = True  # Don't give again this week
 
         # 5. REWARD AL CERRAR TRADE - DSR + bonus/penalty
 
@@ -966,7 +1051,14 @@ class GoldEnv(gym.Env):
     def get_episode_stats(self) -> Dict[str, float]:
         """Get comprehensive statistics for the current episode."""
         equity = np.array(self.equity_curve)
-        returns = np.diff(equity) / equity[:-1] if len(equity) > 1 else np.array([0])
+        if len(equity) > 1:
+            # Protect against division by zero
+            equity_shifted = np.where(equity[:-1] == 0, 1, equity[:-1])
+            returns = np.diff(equity) / equity_shifted
+            # Replace any inf/nan with 0
+            returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
+        else:
+            returns = np.array([0.0])
 
         # Trade statistics
         trade_stats = self.risk_manager.get_trade_stats()
@@ -982,9 +1074,16 @@ class GoldEnv(gym.Env):
         trades_per_hour = total_trades / max(episode_steps, 1)
         trades_per_week_est = trades_per_hour * self.hours_per_week
 
+        # Calculate total return with protection
+        if len(equity) > 0 and equity[0] != 0:
+            total_return = (equity[-1] / equity[0]) - 1
+        else:
+            total_return = 0.0
+        total_return = 0.0 if np.isnan(total_return) or np.isinf(total_return) else total_return
+
         stats = {
             # Returns
-            'total_return': (equity[-1] / equity[0]) - 1 if len(equity) > 0 else 0,
+            'total_return': total_return,
             'sharpe_ratio': self._calculate_sharpe(returns),
             'sortino_ratio': self._calculate_sortino(returns),
             'max_drawdown': self._calculate_max_drawdown(equity),
@@ -1027,16 +1126,20 @@ class GoldEnv(gym.Env):
         excess_returns = returns - risk_free
         downside_returns = returns[returns < 0]
         if len(downside_returns) == 0 or np.std(downside_returns) == 0:
-            return float('inf') if np.mean(excess_returns) > 0 else 0.0
-        return np.mean(excess_returns) / np.std(downside_returns) * np.sqrt(252 * 24)
+            return 99.99 if np.mean(excess_returns) > 0 else 0.0
+        result = np.mean(excess_returns) / np.std(downside_returns) * np.sqrt(252 * 24)
+        return result if not np.isnan(result) and not np.isinf(result) else 0.0
 
     def _calculate_max_drawdown(self, equity: np.ndarray) -> float:
         """Calculate maximum drawdown."""
         if len(equity) < 2:
             return 0.0
         peak = np.maximum.accumulate(equity)
+        # Avoid division by zero
+        peak = np.where(peak == 0, 1, peak)
         drawdown = (peak - equity) / peak
-        return float(np.max(drawdown))
+        result = float(np.max(drawdown))
+        return result if not np.isnan(result) and not np.isinf(result) else 0.0
 
 
 # =============================================================================
